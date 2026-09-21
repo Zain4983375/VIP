@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 import json, os, asyncio
+from datetime import datetime
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 PREFIX = '.'
@@ -12,58 +13,94 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-invite_map: dict[str, int] = {}
+invite_map: dict[str, int] = {}       # code → role_id
+invite_owners: dict[str, int] = {}    # code → user_id (jisne .cc chalayi)
+invite_channels: dict[str, str] = {}  # code → channel name (DM mein dikhane ke liye)
 invite_uses: dict[str, int] = {}
-pending_roles: list[int] = []
+pending_roles: list[dict] = []        # deleted invites ka fallback
 
 
 def save():
     try:
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        data = {
+            "invites": invite_map,
+            "owners": invite_owners,
+            "channels": invite_channels,
+        }
         with open(DATA_FILE, 'w') as f:
-            json.dump(invite_map, f)
-        print(f"[SAVE] invite_map = {invite_map}")
+            json.dump(data, f)
     except Exception as e:
         print(f"[SAVE ERROR] {e}")
 
 
 def load():
+    """Returns (invites, owners, channels). Handles old format too."""
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE) as f:
-                data = {k: int(v) for k, v in json.load(f).items()}
-                print(f"[LOAD] invite_map = {data}")
-                return data
+                raw = json.load(f)
+            # Old format: {code: role_id}
+            if raw and all(isinstance(v, int) for v in raw.values()):
+                return ({k: int(v) for k, v in raw.items()}, {}, {})
+            # New format
+            return (
+                {k: int(v) for k, v in raw.get("invites", {}).items()},
+                {k: int(v) for k, v in raw.get("owners", {}).items()},
+                raw.get("channels", {}),
+            )
     except Exception as e:
         print(f"[LOAD ERROR] {e}")
-    return {}
+    return {}, {}, {}
 
 
 async def take_snapshot(guild):
     try:
         invs = await guild.invites()
-        snap = {i.code: i.uses for i in invs}
-        print(f"[SNAPSHOT] {snap}")
-        return snap
+        return {i.code: i.uses for i in invs}
     except Exception as e:
         print(f"[SNAPSHOT ERROR] {e}")
         return {}
 
 
+async def dm_owner(inviter_id: int, member: discord.Member, role: discord.Role, channel_name: str, invite_code: str):
+    """Inviter ko DM bhejo."""
+    if not inviter_id:
+        return
+    try:
+        user = await bot.fetch_user(inviter_id)
+        embed = discord.Embed(
+            title="🎉 New Member Joined!",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="👤 User", value=f"{member.mention} (`{member.name}`)", inline=False)
+        embed.add_field(name="📨 Invite", value=f"`{invite_code}` → {channel_name or 'Unknown'}", inline=True)
+        embed.add_field(name="🎭 Role Assigned", value=role.mention, inline=True)
+        embed.add_field(name="🏠 Server", value=member.guild.name, inline=False)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"User ID: {member.id}")
+        await user.send(embed=embed)
+        print(f"[DM] Sent to {user.name} about {member.name}")
+    except discord.Forbidden:
+        print(f"[DM] ❌ Can't DM user {inviter_id} (DMs closed)")
+    except Exception as e:
+        print(f"[DM ERROR] {e}")
+
+
 @bot.event
 async def on_ready():
-    global invite_map
-    invite_map = load()
+    global invite_map, invite_owners, invite_channels
+    invite_map, invite_owners, invite_channels = load()
     for g in bot.guilds:
         snap = await take_snapshot(g)
         invite_uses.update(snap)
     print(f"✅ Bot online: {bot.user}")
-    print(f"📋 Loaded invite_map: {invite_map}")
+    print(f"📋 Loaded {len(invite_map)} invites, {len(invite_owners)} owners")
 
 
 @bot.event
 async def on_invite_create(invite):
-    print(f"[INVITE CREATE] {invite.code} uses={invite.uses}")
     invite_uses[invite.code] = invite.uses or 0
 
 
@@ -71,57 +108,71 @@ async def on_invite_create(invite):
 async def on_invite_delete(invite):
     if invite.code in invite_map:
         role_id = invite_map.pop(invite.code)
-        pending_roles.append(role_id)
+        owner_id = invite_owners.pop(invite.code, None)
+        chan_name = invite_channels.pop(invite.code, None)
+        pending_roles.append({
+            "role_id": role_id,
+            "owner_id": owner_id,
+            "channel_name": chan_name,
+            "code": invite.code,
+        })
         save()
-        print(f"[INVITE DELETE] {invite.code} → pending role {role_id}")
+        print(f"[INVITE DELETE] {invite.code} → pending")
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
     print(f"[JOIN] {member.name} joined {guild.name}")
-    print(f"[JOIN] pending_roles = {pending_roles}")
-    print(f"[JOIN] invite_map = {invite_map}")
-    print(f"[JOIN] invite_uses (before) = {invite_uses}")
 
     role_id = None
+    owner_id = None
+    channel_name = None
+    invite_code = None
 
-    # Step 1: Pending role (deleted invite case)
+    # Step 1: Pending (deleted invite case)
     if pending_roles:
-        role_id = pending_roles.pop(0)
-        print(f"[JOIN] Using pending role: {role_id}")
+        p = pending_roles.pop(0)
+        role_id = p["role_id"]
+        owner_id = p.get("owner_id")
+        channel_name = p.get("channel_name")
+        invite_code = p.get("code")
+        print(f"[JOIN] Using pending: role={role_id} owner={owner_id}")
 
-    # Step 2: Retry loop to detect invite
+    # Step 2: Retry loop
     if role_id is None:
         current = {}
         for attempt in range(6):
             current = await take_snapshot(guild)
             matched = False
             for code, uses in current.items():
-                old_uses = invite_uses.get(code, 0)
-                if uses > old_uses and code in invite_map:
+                if uses > invite_uses.get(code, 0) and code in invite_map:
                     role_id = invite_map.pop(code)
+                    owner_id = invite_owners.pop(code, None)
+                    channel_name = invite_channels.pop(code, None)
+                    invite_code = code
                     save()
                     matched = True
-                    print(f"[JOIN] ✅ Matched invite {code} (uses {old_uses}→{uses}) → role {role_id}")
+                    print(f"[JOIN] ✅ Matched invite {code} → role {role_id}")
                     break
             if matched:
                 break
-            print(f"[JOIN] Attempt {attempt+1}: no match yet, waiting 0.4s...")
             await asyncio.sleep(0.4)
 
-        # Step 3: Fallback — invite deleted (single-use auto delete)
+        # Step 3: Fallback — invite map mein hai but guild se gone
         if role_id is None:
             for code in list(invite_map.keys()):
                 if code not in current:
                     role_id = invite_map.pop(code)
+                    owner_id = invite_owners.pop(code, None)
+                    channel_name = invite_channels.pop(code, None)
+                    invite_code = code
                     save()
                     print(f"[JOIN] Fallback: invite {code} gone → role {role_id}")
                     break
 
         invite_uses.clear()
         invite_uses.update(current)
-        print(f"[JOIN] invite_uses (after) = {invite_uses}")
 
     if role_id is None:
         print(f"[JOIN] ❌ No role found for {member.name}")
@@ -129,14 +180,19 @@ async def on_member_join(member: discord.Member):
 
     role = guild.get_role(role_id)
     if not role:
-        print(f"[JOIN] ❌ Role {role_id} not found in guild")
+        print(f"[JOIN] ❌ Role {role_id} not found")
         return
 
+    # Assign role
     try:
         await member.add_roles(role, reason="Auto-assigned via invite")
         print(f"[JOIN] ✅✅ Role '{role.name}' assigned to {member.name}")
     except Exception as e:
         print(f"[JOIN] ❌ ROLE ADD ERROR: {e}")
+        return
+
+    # DM the inviter
+    await dm_owner(owner_id, member, role, channel_name, invite_code)
 
 
 @bot.command(name='cc')
@@ -153,7 +209,6 @@ async def create_channel(ctx, channel_name: str, role_name: str):
     role = discord.utils.get(guild.roles, name=role_name)
     if not role:
         role = await guild.create_role(name=role_name, mentionable=True)
-        print(f"[CC] Created role: {role.name} ({role.id})")
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -177,18 +232,22 @@ async def create_channel(ctx, channel_name: str, role_name: str):
 
     invite = await channel.create_invite(max_uses=1, max_age=0, unique=True)
 
+    # Save role + owner + channel name
     invite_map[invite.code] = role.id
+    invite_owners[invite.code] = ctx.author.id
+    invite_channels[invite.code] = channel_name
     invite_uses[invite.code] = 0
     save()
 
-    print(f"[CC] Created invite {invite.code} → role {role.id}")
+    print(f"[CC] Invite {invite.code} → role {role.id} owner {ctx.author.id}")
 
     msg = (
         f'**:white_check_mark:Done!**\n'
         f'**:pushpin:Channel:** {channel_name}\n'
         f'**:performing_arts:Role:** @{role_name}\n'
         f'**:link:Invite (1-use, never expires):**\n'
-        f'{invite.url}'
+        f'{invite.url}\n\n'
+        f'*Jab koi is link se join karega, tumhe yahan DM mein notification milegi.* 🔔'
     )
     try:
         await ctx.author.send(msg)
