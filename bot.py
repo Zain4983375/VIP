@@ -26,7 +26,7 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 # GLOBAL STATE
 # ─────────────────────────────────────────────
 invite_map: dict[str, int] = {}       # code → role_id
-invite_owners: dict[str, int] = {}    # code → user_id (jisne .cc chalayi)
+invite_owners: dict[str, int] = {}    # code → user_id
 invite_channels: dict[str, str] = {}  # code → channel name
 invite_uses: dict[str, int] = {}      # code → uses count
 pending_roles: list[dict] = []        # deleted invites fallback
@@ -56,7 +56,6 @@ def load():
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE) as f:
                 raw = json.load(f)
-            # Old format: {code: role_id}
             if raw and all(isinstance(v, int) for v in raw.values()):
                 print("[LOAD] Migrating old format...")
                 return ({k: int(v) for k, v in raw.items()}, {}, {})
@@ -84,7 +83,7 @@ async def take_snapshot(guild):
 # ─────────────────────────────────────────────
 async def dm_owner(inviter_id: int, member: discord.Member, role: discord.Role,
                    channel_name: str, invite_code: str):
-    """DM jab role successfully assign ho."""
+    """DM when role is successfully assigned."""
     if not inviter_id:
         print("[DM] ⚠️ No owner_id, skipping DM")
         return
@@ -123,7 +122,7 @@ async def dm_owner(inviter_id: int, member: discord.Member, role: discord.Role,
 
 async def dm_owner_no_role(inviter_id: int, member: discord.Member,
                             channel_name: str, invite_code: str):
-    """DM jab role assign NA ho paye (lekin phir bhi notification jaye)."""
+    """DM when role could NOT be assigned (fallback notification)."""
     if not inviter_id:
         print("[DM] ⚠️ No owner_id, skipping no-role DM")
         return
@@ -199,58 +198,61 @@ async def on_member_join(member: discord.Member):
     guild = member.guild
     print(f"[JOIN] {member.name} joined {guild.name}")
 
+    # Small delay so on_invite_delete can fire first
+    await asyncio.sleep(0.5)
+
     role_id = None
     owner_id = None
     channel_name = None
     invite_code = None
 
-    # ── Step 1: Pending (deleted invite case) ──
-    if pending_roles:
+    # ── Retry loop: check pending_roles EVERY iteration ──
+    current = {}
+    for attempt in range(8):
+        # Check pending every iteration (invite_delete may fire late)
+        if pending_roles and role_id is None:
+            p = pending_roles.pop(0)
+            role_id = p["role_id"]
+            owner_id = p.get("owner_id")
+            channel_name = p.get("channel_name")
+            invite_code = p.get("code")
+            print(f"[JOIN] ✅ Picked from pending: role={role_id} owner={owner_id}")
+            break
+
+        # Snapshot live invites
+        current = await take_snapshot(guild)
+        matched = False
+        for code, uses in current.items():
+            old_uses = invite_uses.get(code, 0)
+            if uses > old_uses and code in invite_map:
+                role_id = invite_map.pop(code)
+                owner_id = invite_owners.pop(code, None)
+                channel_name = invite_channels.pop(code, None)
+                invite_code = code
+                save()
+                matched = True
+                print(f"[JOIN] ✅ Matched live invite {code} (uses {old_uses}→{uses})")
+                break
+
+        if matched:
+            break
+
+        print(f"[JOIN] Attempt {attempt + 1}: no match, waiting 0.5s...")
+        await asyncio.sleep(0.5)
+
+    # ── Final fallback: pending arrived late ──
+    if role_id is None and pending_roles:
         p = pending_roles.pop(0)
         role_id = p["role_id"]
         owner_id = p.get("owner_id")
         channel_name = p.get("channel_name")
         invite_code = p.get("code")
-        print(f"[JOIN] Using pending: role={role_id} owner={owner_id}")
+        print(f"[JOIN] ✅ Late pending pickup: role={role_id} owner={owner_id}")
 
-    # ── Step 2: Retry loop to detect which invite ──
-    if role_id is None:
-        current = {}
-        for attempt in range(6):
-            current = await take_snapshot(guild)
-            matched = False
-            for code, uses in current.items():
-                old_uses = invite_uses.get(code, 0)
-                if uses > old_uses and code in invite_map:
-                    role_id = invite_map.pop(code)
-                    owner_id = invite_owners.pop(code, None)
-                    channel_name = invite_channels.pop(code, None)
-                    invite_code = code
-                    save()
-                    matched = True
-                    print(f"[JOIN] ✅ Matched invite {code} (uses {old_uses}→{uses})")
-                    break
-            if matched:
-                break
-            print(f"[JOIN] Attempt {attempt + 1}: no match, waiting 0.4s...")
-            await asyncio.sleep(0.4)
+    invite_uses.clear()
+    invite_uses.update(current)
 
-        # ── Step 3: Fallback — invite gone from guild ──
-        if role_id is None:
-            for code in list(invite_map.keys()):
-                if code not in current:
-                    role_id = invite_map.pop(code)
-                    owner_id = invite_owners.pop(code, None)
-                    channel_name = invite_channels.pop(code, None)
-                    invite_code = code
-                    save()
-                    print(f"[JOIN] Fallback: invite {code} gone → role {role_id}")
-                    break
-
-        invite_uses.clear()
-        invite_uses.update(current)
-
-    # ── Step 4: Assign role (if found) ──
+    # ── Assign role ──
     role_assigned = None
     if role_id:
         role = guild.get_role(role_id)
@@ -264,7 +266,7 @@ async def on_member_join(member: discord.Member):
         else:
             print(f"[JOIN] ❌ Role {role_id} not found in guild")
 
-    # ── Step 5: DM the inviter (ALWAYS if owner known) ──
+    # ── DM the inviter ──
     if owner_id:
         if role_assigned:
             await dm_owner(owner_id, member, role_assigned, channel_name, invite_code)
@@ -317,10 +319,10 @@ async def create_channel(ctx, channel_name: str, role_name: str):
         category=category
     )
 
-    # Create 1-use never-expire invite
+    # Create 1-use, never-expire invite
     invite = await channel.create_invite(max_uses=1, max_age=0, unique=True)
 
-    # Save mapping (role + owner + channel)
+    # Save mapping
     invite_map[invite.code] = role.id
     invite_owners[invite.code] = ctx.author.id
     invite_channels[invite.code] = channel_name
@@ -336,7 +338,7 @@ async def create_channel(ctx, channel_name: str, role_name: str):
         f'**:performing_arts: Role:** @{role_name}\n'
         f'**:link: Invite (1-use, never expires):**\n'
         f'{invite.url}\n\n'
-        f'*Jab koi is link se join karega, tumhe yahan DM mein notification milegi.* 🔔'
+        f'*When someone joins via this link, you will get a DM notification.* 🔔'
     )
     try:
         await ctx.author.send(msg)
