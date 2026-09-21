@@ -27,9 +27,9 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 # ─────────────────────────────────────────────
 invite_map: dict[str, int] = {}       # code → role_id
 invite_owners: dict[str, int] = {}    # code → user_id (jisne .cc chalayi)
-invite_channels: dict[str, str] = {}  # code → channel name (DM ke liye)
+invite_channels: dict[str, str] = {}  # code → channel name
 invite_uses: dict[str, int] = {}      # code → uses count
-pending_roles: list[dict] = []        # deleted invites ka fallback
+pending_roles: list[dict] = []        # deleted invites fallback
 
 
 # ─────────────────────────────────────────────
@@ -45,22 +45,21 @@ def save():
         }
         with open(DATA_FILE, 'w') as f:
             json.dump(data, f)
-        print(f"[SAVE] Saved {len(invite_map)} invites")
+        print(f"[SAVE] {len(invite_map)} invites saved")
     except Exception as e:
         print(f"[SAVE ERROR] {e}")
 
 
 def load():
-    """Returns (invites, owners, channels). Handles old format too."""
+    """Returns (invites, owners, channels). Handles old format."""
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE) as f:
                 raw = json.load(f)
             # Old format: {code: role_id}
             if raw and all(isinstance(v, int) for v in raw.values()):
-                print("[LOAD] Old format detected, migrating...")
+                print("[LOAD] Migrating old format...")
                 return ({k: int(v) for k, v in raw.items()}, {}, {})
-            # New format
             return (
                 {k: int(v) for k, v in raw.get("invites", {}).items()},
                 {k: int(v) for k, v in raw.get("owners", {}).items()},
@@ -81,23 +80,22 @@ async def take_snapshot(guild):
 
 
 # ─────────────────────────────────────────────
-# DM NOTIFICATION
+# DM NOTIFICATIONS
 # ─────────────────────────────────────────────
 async def dm_owner(inviter_id: int, member: discord.Member, role: discord.Role,
                    channel_name: str, invite_code: str):
-    """Inviter ko DM bhejo jab naya player join kare."""
+    """DM jab role successfully assign ho."""
     if not inviter_id:
-        print("[DM] No owner ID, skipping DM")
+        print("[DM] ⚠️ No owner_id, skipping DM")
         return
 
     try:
         user = await bot.fetch_user(inviter_id)
 
-        # Date/Time in Pakistan Standard Time
         now_pkt = datetime.now(PKT)
-        date_str = now_pkt.strftime("%d %b %Y")          # 22 Sep 2026
-        time_str = now_pkt.strftime("%I:%M %p PKT")      # 08:45 PM PKT
-        discord_ts = f"<t:{int(now_pkt.timestamp())}:F>"  # Auto local time
+        date_str = now_pkt.strftime("%d %b %Y")
+        time_str = now_pkt.strftime("%I:%M %p PKT")
+        discord_ts = f"<t:{int(now_pkt.timestamp())}:F>"
 
         embed = discord.Embed(
             title="🎉 New Player Joined VIP!",
@@ -115,7 +113,45 @@ async def dm_owner(inviter_id: int, member: discord.Member, role: discord.Role,
         embed.set_footer(text=f"User ID: {member.id} • VIP System")
 
         await user.send(embed=embed)
-        print(f"[DM] ✅ Sent notification to {user.name} about {member.name}")
+        print(f"[DM] ✅ Sent notification to {user.name}")
+
+    except discord.Forbidden:
+        print(f"[DM] ❌ Can't DM user {inviter_id} (DMs closed)")
+    except Exception as e:
+        print(f"[DM ERROR] {e}")
+
+
+async def dm_owner_no_role(inviter_id: int, member: discord.Member,
+                            channel_name: str, invite_code: str):
+    """DM jab role assign NA ho paye (lekin phir bhi notification jaye)."""
+    if not inviter_id:
+        print("[DM] ⚠️ No owner_id, skipping no-role DM")
+        return
+
+    try:
+        user = await bot.fetch_user(inviter_id)
+
+        now_pkt = datetime.now(PKT)
+        date_str = now_pkt.strftime("%d %b %Y")
+        time_str = now_pkt.strftime("%I:%M %p PKT")
+        discord_ts = f"<t:{int(now_pkt.timestamp())}:F>"
+
+        embed = discord.Embed(
+            title="👋 New Member Joined (Role Not Assigned)",
+            description=f"{member.mention} joined **{member.guild.name}** but role couldn't be assigned.",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="👤 Player", value=f"{member.mention}\n`{member.name}`", inline=True)
+        embed.add_field(name="📨 Via Channel", value=f"#{channel_name or 'Unknown'}", inline=True)
+        embed.add_field(name="🔗 Invite Code", value=f"`{invite_code or 'N/A'}`", inline=True)
+        embed.add_field(name="📅 Date", value=date_str, inline=True)
+        embed.add_field(name="⏰ Time", value=f"{time_str}\n{discord_ts}", inline=True)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"User ID: {member.id} • VIP System")
+
+        await user.send(embed=embed)
+        print(f"[DM] ✅ Sent (no-role) notification to {user.name}")
 
     except discord.Forbidden:
         print(f"[DM] ❌ Can't DM user {inviter_id} (DMs closed)")
@@ -177,7 +213,7 @@ async def on_member_join(member: discord.Member):
         invite_code = p.get("code")
         print(f"[JOIN] Using pending: role={role_id} owner={owner_id}")
 
-    # ── Step 2: Retry loop to detect which invite was used ──
+    # ── Step 2: Retry loop to detect which invite ──
     if role_id is None:
         current = {}
         for attempt in range(6):
@@ -192,7 +228,7 @@ async def on_member_join(member: discord.Member):
                     invite_code = code
                     save()
                     matched = True
-                    print(f"[JOIN] ✅ Matched invite {code} (uses {old_uses}→{uses}) → role {role_id}")
+                    print(f"[JOIN] ✅ Matched invite {code} (uses {old_uses}→{uses})")
                     break
             if matched:
                 break
@@ -214,25 +250,28 @@ async def on_member_join(member: discord.Member):
         invite_uses.clear()
         invite_uses.update(current)
 
-    if role_id is None:
-        print(f"[JOIN] ❌ No role found for {member.name}")
-        return
+    # ── Step 4: Assign role (if found) ──
+    role_assigned = None
+    if role_id:
+        role = guild.get_role(role_id)
+        if role:
+            try:
+                await member.add_roles(role, reason="Auto-assigned via invite")
+                role_assigned = role
+                print(f"[JOIN] ✅✅ Role '{role.name}' assigned to {member.name}")
+            except Exception as e:
+                print(f"[JOIN] ❌ ROLE ADD ERROR: {e}")
+        else:
+            print(f"[JOIN] ❌ Role {role_id} not found in guild")
 
-    role = guild.get_role(role_id)
-    if not role:
-        print(f"[JOIN] ❌ Role {role_id} not found in guild")
-        return
-
-    # ── Assign role ──
-    try:
-        await member.add_roles(role, reason="Auto-assigned via invite")
-        print(f"[JOIN] ✅✅ Role '{role.name}' assigned to {member.name}")
-    except Exception as e:
-        print(f"[JOIN] ❌ ROLE ADD ERROR: {e}")
-        return
-
-    # ── DM the inviter ──
-    await dm_owner(owner_id, member, role, channel_name, invite_code)
+    # ── Step 5: DM the inviter (ALWAYS if owner known) ──
+    if owner_id:
+        if role_assigned:
+            await dm_owner(owner_id, member, role_assigned, channel_name, invite_code)
+        else:
+            await dm_owner_no_role(owner_id, member, channel_name, invite_code)
+    else:
+        print(f"[JOIN] ⚠️ No owner_id, can't DM anyone")
 
 
 # ─────────────────────────────────────────────
@@ -278,10 +317,10 @@ async def create_channel(ctx, channel_name: str, role_name: str):
         category=category
     )
 
-    # Create 1-use invite
+    # Create 1-use never-expire invite
     invite = await channel.create_invite(max_uses=1, max_age=0, unique=True)
 
-    # Save mapping
+    # Save mapping (role + owner + channel)
     invite_map[invite.code] = role.id
     invite_owners[invite.code] = ctx.author.id
     invite_channels[invite.code] = channel_name
@@ -290,7 +329,7 @@ async def create_channel(ctx, channel_name: str, role_name: str):
 
     print(f"[CC] Invite {invite.code} → role {role.id} owner {ctx.author.id}")
 
-    # DM the invite link
+    # DM invite link
     msg = (
         f'**:white_check_mark: Done!**\n'
         f'**:pushpin: Channel:** {channel_name}\n'
