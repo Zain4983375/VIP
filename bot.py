@@ -22,14 +22,18 @@ def save():
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         with open(DATA_FILE, 'w') as f:
             json.dump(invite_map, f)
+        print(f"[SAVE] invite_map = {invite_map}")
     except Exception as e:
         print(f"[SAVE ERROR] {e}")
+
 
 def load():
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE) as f:
-                return {k: int(v) for k, v in json.load(f).items()}
+                data = {k: int(v) for k, v in json.load(f).items()}
+                print(f"[LOAD] invite_map = {data}")
+                return data
     except Exception as e:
         print(f"[LOAD ERROR] {e}")
     return {}
@@ -38,7 +42,9 @@ def load():
 async def take_snapshot(guild):
     try:
         invs = await guild.invites()
-        return {i.code: i.uses for i in invs}
+        snap = {i.code: i.uses for i in invs}
+        print(f"[SNAPSHOT] {snap}")
+        return snap
     except Exception as e:
         print(f"[SNAPSHOT ERROR] {e}")
         return {}
@@ -52,10 +58,12 @@ async def on_ready():
         snap = await take_snapshot(g)
         invite_uses.update(snap)
     print(f"✅ Bot online: {bot.user}")
+    print(f"📋 Loaded invite_map: {invite_map}")
 
 
 @bot.event
 async def on_invite_create(invite):
+    print(f"[INVITE CREATE] {invite.code} uses={invite.uses}")
     invite_uses[invite.code] = invite.uses or 0
 
 
@@ -65,57 +73,70 @@ async def on_invite_delete(invite):
         role_id = invite_map.pop(invite.code)
         pending_roles.append(role_id)
         save()
+        print(f"[INVITE DELETE] {invite.code} → pending role {role_id}")
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
+    print(f"[JOIN] {member.name} joined {guild.name}")
+    print(f"[JOIN] pending_roles = {pending_roles}")
+    print(f"[JOIN] invite_map = {invite_map}")
+    print(f"[JOIN] invite_uses (before) = {invite_uses}")
 
     role_id = None
 
-    # Step 1: Pending role check (deleted invite wala case)
+    # Step 1: Pending role (deleted invite case)
     if pending_roles:
         role_id = pending_roles.pop(0)
+        print(f"[JOIN] Using pending role: {role_id}")
 
-    # Step 2: Retry loop — har 0.3s mein try karo, max 5 baar
+    # Step 2: Retry loop to detect invite
     if role_id is None:
-        for attempt in range(5):
+        current = {}
+        for attempt in range(6):
             current = await take_snapshot(guild)
             matched = False
             for code, uses in current.items():
-                if uses > invite_uses.get(code, 0) and code in invite_map:
+                old_uses = invite_uses.get(code, 0)
+                if uses > old_uses and code in invite_map:
                     role_id = invite_map.pop(code)
                     save()
                     matched = True
+                    print(f"[JOIN] ✅ Matched invite {code} (uses {old_uses}→{uses}) → role {role_id}")
                     break
             if matched:
                 break
-            await asyncio.sleep(0.3)  # chhota delay
+            print(f"[JOIN] Attempt {attempt+1}: no match yet, waiting 0.4s...")
+            await asyncio.sleep(0.4)
 
-        # Fallback: invite map mein hai lekin guild mein nahi
+        # Step 3: Fallback — invite deleted (single-use auto delete)
         if role_id is None:
-            current = await take_snapshot(guild)
             for code in list(invite_map.keys()):
                 if code not in current:
                     role_id = invite_map.pop(code)
                     save()
+                    print(f"[JOIN] Fallback: invite {code} gone → role {role_id}")
                     break
 
         invite_uses.clear()
         invite_uses.update(current)
+        print(f"[JOIN] invite_uses (after) = {invite_uses}")
 
     if role_id is None:
+        print(f"[JOIN] ❌ No role found for {member.name}")
         return
 
     role = guild.get_role(role_id)
     if not role:
+        print(f"[JOIN] ❌ Role {role_id} not found in guild")
         return
 
     try:
-        await member.add_roles(role, reason="Auto-assigned via invite link")
-        print(f"✅ Role {role.name} assigned to {member.name}")
+        await member.add_roles(role, reason="Auto-assigned via invite")
+        print(f"[JOIN] ✅✅ Role '{role.name}' assigned to {member.name}")
     except Exception as e:
-        print(f"[ROLE ADD ERROR] {e}")
+        print(f"[JOIN] ❌ ROLE ADD ERROR: {e}")
 
 
 @bot.command(name='cc')
@@ -132,6 +153,7 @@ async def create_channel(ctx, channel_name: str, role_name: str):
     role = discord.utils.get(guild.roles, name=role_name)
     if not role:
         role = await guild.create_role(name=role_name, mentionable=True)
+        print(f"[CC] Created role: {role.name} ({role.id})")
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -158,6 +180,8 @@ async def create_channel(ctx, channel_name: str, role_name: str):
     invite_map[invite.code] = role.id
     invite_uses[invite.code] = 0
     save()
+
+    print(f"[CC] Created invite {invite.code} → role {role.id}")
 
     msg = (
         f'**:white_check_mark:Done!**\n'
