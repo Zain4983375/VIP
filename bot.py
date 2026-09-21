@@ -70,26 +70,37 @@ async def on_invite_delete(invite):
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
-    await asyncio.sleep(1.5)
 
     role_id = None
 
+    # Step 1: Pending role check (deleted invite wala case)
     if pending_roles:
         role_id = pending_roles.pop(0)
 
+    # Step 2: Retry loop — har 0.3s mein try karo, max 5 baar
     if role_id is None:
-        current = await take_snapshot(guild)
-        for code, uses in current.items():
-            if uses > invite_uses.get(code, 0) and code in invite_map:
-                role_id = invite_map.pop(code)
-                save()
+        for attempt in range(5):
+            current = await take_snapshot(guild)
+            matched = False
+            for code, uses in current.items():
+                if uses > invite_uses.get(code, 0) and code in invite_map:
+                    role_id = invite_map.pop(code)
+                    save()
+                    matched = True
+                    break
+            if matched:
                 break
+            await asyncio.sleep(0.3)  # chhota delay
+
+        # Fallback: invite map mein hai lekin guild mein nahi
         if role_id is None:
+            current = await take_snapshot(guild)
             for code in list(invite_map.keys()):
                 if code not in current:
                     role_id = invite_map.pop(code)
                     save()
                     break
+
         invite_uses.clear()
         invite_uses.update(current)
 
@@ -101,7 +112,8 @@ async def on_member_join(member: discord.Member):
         return
 
     try:
-        await member.add_roles(role)
+        await member.add_roles(role, reason="Auto-assigned via invite link")
+        print(f"✅ Role {role.name} assigned to {member.name}")
     except Exception as e:
         print(f"[ROLE ADD ERROR] {e}")
 
