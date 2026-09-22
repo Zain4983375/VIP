@@ -5,6 +5,7 @@ Commands:
     .helpbot    -> show help
 
 Join results are posted in the channel where .c was used.
+The new channel is created inside the SAME CATEGORY as the .c command channel.
 
 ⚠️ IMPORTANT (Discord Developer Portal):
    Enable "SERVER MEMBERS INTENT" and "MESSAGE CONTENT INTENT" under
@@ -116,7 +117,7 @@ async def send_to_output_channel(guild: discord.Guild, record: InviteRecord, mes
 
 
 async def refresh_tracked_invites(guild: discord.Guild) -> None:
-    """Sync last_uses for invites that still exist (do NOT mark missing as used here)."""
+    """Sync last_uses for invites that still exist."""
     try:
         invites = await guild.invites()
     except discord.Forbidden:
@@ -155,7 +156,6 @@ async def find_used_tracked_invite(guild: discord.Guild) -> Optional[InviteRecor
             used = record
 
     # Case 2: 1-use invite is DELETED by Discord after being used.
-    # If a tracked invite with last_uses==0 vanished, it was just used.
     if used is None:
         for code, record in invite_records.items():
             if record.guild_id != guild.id:
@@ -207,7 +207,6 @@ async def on_member_join(member: discord.Member) -> None:
             record = await find_used_tracked_invite(member.guild)
 
             if not record:
-                # Last-resort fallback: pick newest tracked invite with last_uses==0.
                 candidates = [
                     item for item in invite_records.values()
                     if item.guild_id == member.guild.id and item.last_uses == 0
@@ -314,7 +313,9 @@ async def create_player_access(ctx: commands.Context, *, label: str = "") -> Non
                 ),
             }
             channel = await guild.create_text_channel(
-                label[:90], overwrites=overwrites,
+                label[:90],
+                overwrites=overwrites,
+                category=ctx.channel.category,   # 👈 same category as .c command channel
                 reason=f"Private player channel for {label}",
             )
             invite = await channel.create_invite(
@@ -359,7 +360,8 @@ async def helpbot(ctx: commands.Context) -> None:
     await ctx.reply(
         "**Player Bot**\n"
         "`.c example` — create a private channel, role, and one-use invite.\n"
-        "Player join results are posted in the channel where `.c` was used.",
+        "Player join results are posted in the channel where `.c` was used.\n"
+        "The new channel is created inside the same category as the command channel.",
         mention_author=False,
     )
 
