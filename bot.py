@@ -206,24 +206,27 @@ async def on_member_join(member: discord.Member) -> None:
         async with state_lock:
             record = await find_used_tracked_invite(member.guild)
 
-            if not record:
-                candidates = [
-                    item for item in invite_records.values()
-                    if item.guild_id == member.guild.id and item.last_uses == 0
-                ]
-                if candidates:
-                    record = candidates[-1]
-                    record.last_uses = 1
-                    save_state()
-
+            # ❌ FIX: Fallback (random role) hata diya.
+            # Agar track nahi ho paya to koi role assign nahi karega.
             if not record:
                 log.warning(
-                    "Could not identify a tracked invite for member %s in guild %s.",
+                    "Could not identify a tracked invite for member %s in guild %s. No role assigned.",
                     member.id, member.guild.id,
                 )
                 return
 
-            role = member.guild.get_role(record.role_id)
+            # ✅ FIX: Role ko channel ke naam se dhundho, taaki same naam wala role assign ho.
+            channel = await resolve_channel(member.guild, record.channel_id)
+            role = None
+
+            if channel:
+                # Channel ka naam hi role ka naam hai (jaise .c example me dono "example" hote hain)
+                role = discord.utils.get(member.guild.roles, name=channel.name)
+
+            # Agar channel name se role na mile, to backup ke liye saved role_id use karo.
+            if role is None:
+                role = member.guild.get_role(record.role_id)
+
             timestamp = discord.utils.format_dt(discord.utils.utcnow(), style="F")
             player_name = discord.utils.escape_markdown(member.display_name)
 
