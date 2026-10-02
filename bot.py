@@ -374,6 +374,11 @@ async def create_player_access(ctx: commands.Context, *, label: str = "") -> Non
                 max_age=0, max_uses=1, unique=True,
                 reason=f"Tracked player invite for {label}",
             )
+
+            # Discord channel names ko normalize kar sakta hai (lowercase waghera),
+            # is liye role ka naam final channel naam se match kara do.
+            if role.name != channel.name:
+                await role.edit(name=channel.name, reason="Match private channel name")
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.exception("Could not create player access for %s", label)
             await ctx.reply(f"❌ Creation failed: `{exc}`", mention_author=False)
@@ -421,8 +426,37 @@ async def delete_player_access(ctx: commands.Context, *, label: str = "") -> Non
         guild = ctx.guild
         assert guild is not None
 
-        channel = discord.utils.get(guild.text_channels, name=label)
-        role = discord.utils.get(guild.roles, name=label)
+        # Step 1 (most reliable): state file me is label ka exact channel/role ID dhoondo.
+        # Naam badal bhi gaya ho to ID se mil jayega.
+        record = next(
+            (r for r in invite_records.values()
+             if r.guild_id == guild.id and r.label == label),
+            None,
+        )
+
+        channel = None
+        role = None
+        if record is not None:
+            channel = await resolve_channel(guild, record.channel_id)
+            role = guild.get_role(record.role_id)
+            if role is None:
+                log.warning("Role id %s from state not found in guild %s.", record.role_id, guild.id)
+
+        # Step 2 (fallback): naam se dhoondo — case-insensitive.
+        if channel is None:
+            channel = discord.utils.get(guild.text_channels, name=label)
+        if channel is None:
+            channel = discord.utils.find(
+                lambda c: c.name.lower() == label.lower(), guild.text_channels
+            )
+        if role is None:
+            role = discord.utils.get(guild.roles, name=label)
+        if role is None:
+            role = discord.utils.find(
+                lambda r: r.name.lower() == label.lower(), guild.roles
+            )
+        if role is None:
+            log.warning("No role found for label '%s' in guild %s.", label, guild.id)
 
         deleted_lines: list[str] = []
 
